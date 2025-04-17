@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+feast[gcp] # Or your preferred Feast provider
+kafka-python
+pandas
+pydantic
