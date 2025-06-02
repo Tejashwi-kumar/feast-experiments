@@ -1,0 +1,110 @@
+sequenceDiagram
+    participant CI as Consumer Instance
+    participant KCL as Kafka Client Library
+    participant KB as Kafka Broker (Topic)
+    participant PL as Processing Logic
+    participant ExtAPI as External API
+    participant OS as Offset Store (Kafka/External)
+    participant RT as Retry Topic
+    participant DLQT as DLQ Topic
+
+    CI->>KCL: Initialize & Subscribe(topic, group_id)
+    KCL->>KB: Register Consumer, Join Group
+    activate KCL
+
+    loop Message Polling & Processing
+        CI->>KCL: poll(timeout)
+        KCL->>KB: Fetch Messages
+        KB-->>KCL: Records (batch)
+        KCL-->>CI: Records
+        deactivate KCL
+
+        opt No records received
+            CI->>CI: Continue polling loop
+        end
+
+        CI->>PL: Process(Records Batch)
+        activate PL
+
+        loop For Each Message in Batch
+            PL->>PL: Attempt to process message
+            PL->>ExtAPI: Call External API with message data
+
+            alt Happy Path (API Call Successful)
+                activate ExtAPI
+                ExtAPI-->>PL: API Success Response
+                %% deactivate ExtAPI removed based on hypothesis
+                PL->>CI: Message Processed Successfully (add offset to commit list)
+            else API Call Transient Error (e.g., timeout, 5xx)
+                activate ExtAPI
+                ExtAPI-->>PL: API Error Response
+                %% deactivate ExtAPI removed based on hypothesis
+                PL->>PL: Initiate Retry Strategy (e.g., exponential backoff)
+                note left of PL: Conceptual: hasBeenSuccessfullyRetried = false
+
+                loop Retry Attempts
+                    alt If not hasBeenSuccessfullyRetried_for_this_message
+                        PL->>ExtAPI: Retry API Call
+                        activate ExtAPI
+                        alt Retry Successful
+                            ExtAPI-->>PL: API Success Response
+                            %% deactivate ExtAPI removed based on hypothesis
+                            PL->>CI: Message Processed Successfully after Retry
+                            note left of PL: Conceptual: hasBeenSuccessfullyRetried_for_this_message = true
+                            note right of PL: Success! Further retries in this loop will be skipped for this message.
+                        else Retry Fails:
+                            ExtAPI-->>PL: API Error Response
+                            %% deactivate ExtAPI removed based on hypothesis
+                            note right of PL: Retry attempt failed. Loop continues if attempts remain.
+                        end
+                    else Message Was Already Processed Successfully
+                        PL->>PL: (Skipping further retries for this message in this loop)
+                    end
+                end
+
+                opt Retries Exhausted and message still not successful
+                    PL->>RT: Send message to Retry Topic (optional)
+                    activate RT
+                    RT-->>PL: Ack
+                    deactivate RT
+                    PL->>CI: Message to be retried later
+                    note right of PL: Or send to DLQ if no retry topic
+                end
+            else API Call Non-Transient Error / Poison Pill (e.g., 4xx, bad data)
+                activate ExtAPI
+                ExtAPI-->>PL: API Error Response
+                %% deactivate ExtAPI removed based on hypothesis
+                PL->>DLQT: Send message to DLQ
+                activate DLQT
+                DLQT-->>PL: Ack
+                deactivate DLQT
+                PL->>CI: Message Sent to DLQ
+            end
+        end
+        deactivate PL
+
+        CI->>KCL: commitOffsetsAsync(processed_offsets_list)
+        activate KCL
+        KCL->>OS: Store Offsets
+        OS-->>KCL: Commit Ack (async callback)
+        KCL-->>CI: Callback (success/failure)
+        deactivate KCL
+        note right of CI: Handle commit failure in callback (log, potentially stop)
+    end
+
+    participant CS as Consumer Shutdown
+    CI->>CS: Shutdown Signal Received
+    activate CS
+    CS->>CI: Stop Polling Loop
+    CS->>PL: Wait for in-flight processing
+    PL-->>CS: Processing Complete
+    CS->>KCL: commitOffsetsSync(final_offsets)
+    activate KCL
+    KCL->>OS: Store Final Offsets
+    OS-->>KCL: Commit Ack
+    deactivate KCL
+    CS->>KCL: close()
+    activate KCL
+    KCL->>KB: Leave Consumer Group
+    deactivate KCL
+    deactivate CS
