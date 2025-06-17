@@ -6,15 +6,15 @@ import time
 from datetime import datetime, timezone
 import argparse
 import io
+import json
 
 # Confluent Kafka library
 from confluent_kafka import Producer
 
-# --- New Imports for GCP OAuth and Manual Avro Serialization ---
+# --- New Imports for GCP OAuth and fastavro Serialization ---
 import google.auth
 import google.auth.transport.requests
-import avro.schema
-import avro.io
+from fastavro import writer, parse_schema
 
 
 # --- Class for GCP OAuth Token Handling (Unchanged) ---
@@ -106,12 +106,11 @@ FEATURE_ID_MAP = {name: i for i, name in enumerate(FEATURES, 1001)}
 
 def serialize_avro(schema, message_dict):
     """
-    Serializes a Python dictionary into Avro binary format based on a given schema.
+    Serializes a Python dictionary into Avro binary format using fastavro.
     """
-    writer = avro.io.DatumWriter(schema)
     bytes_writer = io.BytesIO()
-    encoder = avro.io.BinaryEncoder(bytes_writer)
-    writer.write(message_dict, encoder)
+    # fastavro writer takes an iterable of records, so we wrap the single message in a list.
+    writer(bytes_writer, schema, [message_dict])
     return bytes_writer.getvalue()
 
 
@@ -128,8 +127,9 @@ def main(args):
     """Main function to set up the producer and send messages."""
     topic = args.topic
 
-    # Parse the Avro schema once at the beginning.
-    avro_schema = avro.schema.parse(AVRO_SCHEMA_STR)
+    # Parse the Avro schema once at the beginning using fastavro.
+    # It requires a dictionary, so we load the JSON string first.
+    avro_schema = parse_schema(json.loads(AVRO_SCHEMA_STR))
 
     # --- Updated Producer Configuration (No Serializers) ---
     producer_config = {
@@ -191,4 +191,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     main(args)
-
