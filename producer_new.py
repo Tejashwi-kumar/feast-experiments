@@ -1,16 +1,64 @@
-# kafka_feature_producer.py
+# kafka_feature_producer_oauth.py
 
 import uuid
 import random
+import time
 from datetime import datetime, timezone
 import argparse
-from confluent_kafka import SerializingProducer
-from confluent_kafka.schema_registry import SchemaRegistryClient
-from confluent_kafka.schema_registry.avro import AvroSerializer
-from confluent_kafka.serialization import StringSerializer
+import io
+
+# Confluent Kafka library
+from confluent_kafka import Producer
+
+# --- New Imports for GCP OAuth and Manual Avro Serialization ---
+import google.auth
+import google.auth.transport.requests
+import avro.schema
+import avro.io
+
+
+# --- Class for GCP OAuth Token Handling (Unchanged) ---
+class GcpOauthCallback:
+    """
+    This class is a callable that provides OAuth tokens for the Kafka client.
+    It automatically handles fetching and refreshing the token from Google's
+    metadata server or a local service account file.
+    """
+    def __init__(self):
+        # Use google.auth.default() to find credentials automatically in the environment
+        # (e.g., GCE metadata server, GKE Workload Identity, GOOGLE_APPLICATION_CREDENTIALS)
+        print("Initializing GCP credentials...")
+        self._creds, self._project_id = google.auth.default(
+            scopes=['https://www.googleapis.com/auth/cloud-platform']
+        )
+        self._request = google.auth.transport.requests.Request()
+        self._token = None
+        # The token expiry time, as a Unix timestamp.
+        self._token_expiry = 0
+
+    def __call__(self, config_str):
+        """
+        This method is invoked by the Kafka client when it needs a token.
+        It returns the token and its expiration time in milliseconds.
+        """
+        # Refresh the token if it's expired or about to expire (60s buffer).
+        if time.time() > self._token_expiry - 60:
+            print("OAuth token is expiring or expired, refreshing...")
+            self._creds.refresh(self._request)
+            self._token = self._creds.token
+            if self._creds.expiry:
+                 self._token_expiry = self._creds.expiry.timestamp()
+                 print(f"Successfully refreshed OAuth token. New expiry: {self._creds.expiry}")
+            else:
+                # Set a default expiry if not provided, e.g., 55 minutes from now.
+                self._token_expiry = time.time() + 3300
+                print("Successfully refreshed OAuth token. No expiry in credential, using default.")
+
+        # The Kafka client expects a tuple of (token_string, expiry_time_ms)
+        return self._token, self._token_expiry * 1000
+
 
 # Define the Avro schema for the Kafka message value.
-# This schema matches the structure specified in the requirements.
 AVRO_SCHEMA_STR = """
 {
     "type": "record",
@@ -41,7 +89,6 @@ AVRO_SCHEMA_STR = """
 """
 
 # Define the list of 25 features.
-# In a real-world scenario, this might come from a config file or a database.
 FEATURES = [
     "count_ao_events_1min", "count_ao_events_5min", "count_ao_events_15min",
     "device_real_loc", "user_avg_spend_1d", "user_avg_spend_7d",
@@ -57,11 +104,19 @@ FEATURES = [
 FEATURE_ID_MAP = {name: i for i, name in enumerate(FEATURES, 1001)}
 
 
+def serialize_avro(schema, message_dict):
+    """
+    Serializes a Python dictionary into Avro binary format based on a given schema.
+    """
+    writer = avro.io.DatumWriter(schema)
+    bytes_writer = io.BytesIO()
+    encoder = avro.io.BinaryEncoder(bytes_writer)
+    writer.write(message_dict, encoder)
+    return bytes_writer.getvalue()
+
+
 def delivery_report(err, msg):
-    """
-    Callback function to report the result of a produce operation.
-    This is called once for each message produced.
-    """
+    """Callback function to report the result of a produce operation."""
     if err is not None:
         print(f"Message delivery failed for key {msg.key().decode('utf-8')}: {err}")
     else:
@@ -70,89 +125,53 @@ def delivery_report(err, msg):
 
 
 def main(args):
-    """
-    Main function to set up the producer and send messages.
-    """
+    """Main function to set up the producer and send messages."""
     topic = args.topic
 
-    # --- 1. Configure Serializer ---
-    # Set up the Schema Registry client and the Avro serializer for the message value.
-    schema_registry_client = SchemaRegistryClient({'url': args.schema_registry})
-    avro_serializer = AvroSerializer(
-        schema_registry_client,
-        AVRO_SCHEMA_STR
-    )
+    # Parse the Avro schema once at the beginning.
+    avro_schema = avro.schema.parse(AVRO_SCHEMA_STR)
 
-    # --- 2. Configure Producer ---
-    # The key will be a string, and the value will be Avro-serialized.
+    # --- Updated Producer Configuration (No Serializers) ---
     producer_config = {
         'bootstrap.servers': args.bootstrap_servers,
-        'key.serializer': StringSerializer('utf_8'),
-        'value.serializer': avro_serializer,
-        # 'linger.ms': 10, # Optional: wait 10ms to batch messages
-        # 'compression.type': 'snappy', # Optional: use compression
+        # --- SASL/OAUTHBEARER Configuration ---
+        'security.protocol': 'SASL_SSL',
+        'sasl.mechanisms': 'OAUTHBEARER',
+        'oauth_cb': GcpOauthCallback()
     }
-    producer = SerializingProducer(producer_config)
+
+    print("Initializing Kafka producer with OAUTHBEARER...")
+    # Use the base Producer, as we are providing already-serialized bytes.
+    producer = Producer(producer_config)
+    print("Producer initialized.")
 
     print(f"Producing records for {len(FEATURES)} features to topic '{topic}'. Press Ctrl+C to exit.")
 
     try:
-        # --- 3. Generate and Produce Messages ---
-        # Loop through every defined feature to create a message for it.
+        # Generate and Produce Messages
         for feature_name, feature_id in FEATURE_ID_MAP.items():
-
-            # A. Generate a message for the 'device_id' entity
+            # A. 'device_id' entity
             device_id = f"device-{uuid.uuid4()}"
-            device_message = {
-                "attributes": [device_id],
-                "feature_id": feature_id,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "count": random.randint(1, 1000)
-            }
-            # The partition key is the unique combination of the entity and the feature.
+            device_message = {"attributes": [device_id], "feature_id": feature_id, "ts": datetime.now(timezone.utc).isoformat(), "count": random.randint(1, 1000)}
             device_key = f"{device_id}-{feature_id}"
-            producer.produce(
-                topic=topic,
-                key=device_key,
-                value=device_message,
-                on_delivery=delivery_report
-            )
+            serialized_value = serialize_avro(avro_schema, device_message)
+            producer.produce(topic=topic, key=device_key.encode('utf-8'), value=serialized_value, on_delivery=delivery_report)
 
-            # B. Generate a message for the standalone 'subscriber_id' entity
+            # B. 'subscriber_id' entity
             subscriber_id = f"sub-{random.randint(100000, 999999)}"
-            subscriber_message = {
-                "attributes": [subscriber_id],
-                "feature_id": feature_id,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "count": random.randint(1, 1000)
-            }
+            subscriber_message = {"attributes": [subscriber_id], "feature_id": feature_id, "ts": datetime.now(timezone.utc).isoformat(), "count": random.randint(1, 1000)}
             subscriber_key = f"{subscriber_id}-{feature_id}"
-            producer.produce(
-                topic=topic,
-                key=subscriber_key,
-                value=subscriber_message,
-                on_delivery=delivery_report
-            )
+            serialized_value = serialize_avro(avro_schema, subscriber_message)
+            producer.produce(topic=topic, key=subscriber_key.encode('utf-8'), value=serialized_value, on_delivery=delivery_report)
 
-            # C. Generate a message for the combined 'subscriber_id:account_id' entity
-            sub_id_for_combo = f"sub-{random.randint(100000, 999999)}"
-            acc_id_for_combo = f"acc-{random.randint(5000, 9999)}"
+            # C. 'subscriber_id:account_id' entity
+            sub_id_for_combo, acc_id_for_combo = f"sub-{random.randint(100000, 999999)}", f"acc-{random.randint(5000, 9999)}"
             combined_entity = f"{sub_id_for_combo}:{acc_id_for_combo}"
-            combined_message = {
-                "attributes": [combined_entity],
-                "feature_id": feature_id,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "count": random.randint(1, 1000)
-            }
+            combined_message = {"attributes": [combined_entity], "feature_id": feature_id, "ts": datetime.now(timezone.utc).isoformat(), "count": random.randint(1, 1000)}
             combined_key = f"{combined_entity}-{feature_id}"
-            producer.produce(
-                topic=topic,
-                key=combined_key,
-                value=combined_message,
-                on_delivery=delivery_report
-            )
+            serialized_value = serialize_avro(avro_schema, combined_message)
+            producer.produce(topic=topic, key=combined_key.encode('utf-8'), value=serialized_value, on_delivery=delivery_report)
 
-            # Poll for events. This is non-blocking and handles delivery reports.
             producer.poll(0)
 
     except KeyboardInterrupt:
@@ -160,17 +179,16 @@ def main(args):
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
-        # --- 4. Flush and Cleanup ---
-        # Wait for any outstanding messages to be delivered and delivery reports to be received.
         print("\nFlushing producer...")
         producer.flush()
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Kafka Avro Producer for Feature Events")
-    parser.add_argument('-b', '--bootstrap-servers', default='localhost:9092', help='Kafka bootstrap server(s)')
-    parser.add_argument('-s', '--schema-registry', default='http://localhost:8081', help='Schema Registry URL')
+    parser = argparse.ArgumentParser(description="Kafka Avro Producer for Feature Events with GCP OAuth")
+    parser.add_argument('-b', '--bootstrap-servers', required=True, help='Kafka bootstrap server(s)')
+    # The --schema-registry argument has been removed.
     parser.add_argument('-t', '--topic', default='feature_events', help='Kafka topic to produce to')
     args = parser.parse_args()
 
     main(args)
+
