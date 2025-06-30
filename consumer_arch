@@ -1,0 +1,25 @@
+graph TD
+    subgraph Data Sources
+        A[External Systems/Producers] -- Real-time Event Data --> B(Kafka: raw_events_topic)
+    end
+
+    subgraph Streaming Ingestion & Feature Engineering
+        B -- Consume raw events --> C[Feature Engineering Service]
+        C -- Publish transformed features --> D(Kafka: processed_features_topic)
+    end
+
+    subgraph Feature Store
+        D -- Stream Ingestion Job --> E[Feast]
+        E -- Manages & Populates --> F(Redis: Online Feature Store Backend)
+        subgraph Feast Internals
+            E -- Offline_Store_for_training --> Store[(Offline Store)]
+        end
+    end
+
+    subgraph Inference Service
+        H[Clients/Consumers] -- Prediction Request (/predict) --> I[(Inference Service)]
+        I -- Query for Features (Feast SDK) --> F
+        I -- Feed Features --> J(ML Model)
+        J -- Prediction --> I
+        I -- Return Prediction --> H
+    end
