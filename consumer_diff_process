@@ -1,0 +1,220 @@
+import time
+import pandas as pd
+from multiprocessing import Process, Queue
+from confluent_kafka import Consumer
+from feast import FeatureStore
+import logging
+
+# --- Configuration ---
+
+# KAFKA CONFIGURATION
+KAFKA_CONF = {
+    'bootstrap.servers': 'YOUR_KAFKA_BROKER_HOST:9092',  # <-- IMPORTANT: Replace
+    'group.id': 'feast-high-throughput-writer-group-single-partition',
+    'auto.offset.reset': 'latest',
+    # Fetch a large number of messages at once from the broker
+    'fetch.max.bytes': 52428800, # 50 MB
+    'max.partition.fetch.bytes': 10485760, # 10 MB
+}
+KAFKA_TOPIC = 'your_feature_topic' # <-- IMPORTANT: Replace
+
+# FEAST & BATCHING CONFIGURATION
+FEAST_REPO_PATH = "."
+# This is the most critical tuning parameter.
+# A larger batch size is more efficient for Redis but uses more memory.
+BATCH_SIZE = 10000
+# Max time to wait before writing a partial batch to avoid stale data
+BATCH_TIMEOUT_SECONDS = 0.4 
+
+# This mapping must be in-memory for fast lookups.
+FEATURE_ID_TO_VIEW_MAP = {
+    1001: "driver_hourly_stats",
+    # ... add all your feature_id -> feature_view mappings here
+}
+
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(processName)s - %(message)s'
+)
+
+def consumer_worker(kafka_config: dict, topic: str, data_queue: Queue):
+    """
+    This process's ONLY job is to read from Kafka, deserialize, and put
+    the result on the queue as quickly as possible.
+    """
+    logging.info("Consumer process started.")
+    consumer = Consumer(kafka_config)
+    consumer.subscribe([topic])
+    
+    # In a real application, load your Avro schema here for deserialization
+    # from fastavro import schemaless_reader
+    # from io import BytesIO
+
+    try:
+        while True:
+            # The timeout is low because we expect a constant stream of data.
+            # The number of messages returned is limited by broker-side configurations
+            # and the fetch.*.bytes parameters.
+            messages = consumer.consume(num_messages=10000, timeout=0.5)
+
+            if not messages:
+                continue
+
+            for msg in messages:
+                if msg.error():
+                    logging.warning(f"Consumer error: {msg.error()}")
+                    continue
+
+                # --- Hot Path: Deserialize and minimal processing ---
+                try:
+                    # Replace this with your actual Avro deserialization logic
+                    # This is a placeholder for speed.
+                    parts = msg.value().decode('utf-8').split(',')
+                    feature_id = int(parts[0])
+                    feature_value = float(parts[1])
+                    # Your message should ideally contain its own timestamp.
+                    event_timestamp = pd.Timestamp.now(tz='UTC')
+                except Exception as e:
+                    logging.error(f"Failed to parse message: {msg.value()}, error: {e}")
+                    continue
+
+                # --- Put structured data onto the queue ---
+                # The writer process will handle the feature view lookup.
+                data_queue.put((feature_id, feature_value, event_timestamp))
+
+    except KeyboardInterrupt:
+        logging.info("Consumer shutting down.")
+    finally:
+        consumer.close()
+
+
+def redis_writer_worker(data_queue: Queue, feast_repo_path: str, batch_size: int, batch_timeout: float):
+    """
+    This process pulls from the queue, batches data, creates a DataFrame,
+    and performs the heavy write operation to Redis via Feast.
+    """
+    logging.info("Writer process started.")
+    fs = FeatureStore(repo_path=feast_repo_path)
+    batch = []
+    last_write_time = time.time()
+
+    while True:
+        try:
+            # Pull as many items as possible from the queue to build the batch
+            while len(batch) < batch_size and not data_queue.empty():
+                batch.append(data_queue.get_nowait())
+
+            time_since_last_write = time.time() - last_write_time
+
+            # Trigger a write if the batch is full or the timeout is hit
+            if len(batch) >= batch_size or (len(batch) > 0 and time_since_last_write > batch_timeout):
+                
+                start_time = time.time()
+
+                # --- Heavy Lifting: Data Transformation and Writing ---
+                
+                # 1. Perform the feature view lookup
+                processed_records = []
+                for feature_id, value, ts in batch:
+                    view_name = FEATURE_ID_TO_VIEW_MAP.get(feature_id)
+                    if view_name:
+                        # The entity ID in this example is the feature_id itself.
+                        # Adjust if your entity (e.g., driver_id) is different.
+                        entity_id = str(feature_id) 
+                        processed_records.append((view_name, entity_id, "count", value, ts))
+
+                if not processed_records:
+                    batch = [] # Clear the batch if all records were unmapped
+                    continue
+
+                # 2. Convert to a single DataFrame
+                df = pd.DataFrame(
+                    processed_records,
+                    columns=["feature_view", "entity_id", "feature_name", "value", "event_timestamp"]
+                )
+
+                # 3. Group by feature_view and write to Feast
+                for view_name, group_df in df.groupby("feature_view"):
+                    try:
+                        # Pivot to the format Feast expects: [timestamp, entity_id, feature_1, feature_2, ...]
+                        pivoted_df = group_df.pivot_table(
+                            index=["event_timestamp", "entity_id"],
+                            columns="feature_name",
+                            values="value"
+                        ).reset_index()
+
+                        # IMPORTANT: Rename the entity column to match your Feast definition
+                        pivoted_df.rename(columns={'entity_id': 'driver_id'}, inplace=True)
+
+                        fs.write_to_online_store(
+                            feature_view_name=view_name,
+                            entity_df=pivoted_df
+                        )
+                    except Exception as e:
+                        logging.error(f"Failed to write view '{view_name}': {e}")
+
+                duration = time.time() - start_time
+                rate = len(batch) / duration if duration > 0 else float('inf')
+                logging.info(f"Wrote batch of {len(batch)} in {duration:.3f}s ({rate:,.0f} records/s).")
+
+                # Reset for the next batch
+                batch = []
+                last_write_time = time.time()
+
+            else:
+                # Sleep briefly to prevent a tight CPU loop when the queue is empty
+                time.sleep(0.001)
+
+        except Exception as e:
+            logging.error(f"FATAL error in writer process: {e}")
+            batch = [] # Clear batch on error
+            time.sleep(1)
+
+
+if __name__ == '__main__':
+    logging.info("Starting single-partition, high-throughput pipeline...")
+    
+    # This queue is the buffer between the consumer and writer.
+    # A maxsize provides backpressure if the writer falls behind.
+    data_queue = Queue(maxsize=200000)
+
+    # Start the writer process
+    writer_process = Process(
+        target=redis_writer_worker, 
+        args=(data_queue, FEAST_REPO_PATH, BATCH_SIZE, BATCH_TIMEOUT_SECONDS),
+        name="Writer"
+    )
+    writer_process.daemon = True
+    writer_process.start()
+
+    # Start the single consumer process
+    consumer_process = Process(
+        target=consumer_worker, 
+        args=(KAFKA_CONF, KAFKA_TOPIC, data_queue),
+        name="Consumer"
+    )
+    consumer_process.daemon = True
+    consumer_process.start()
+
+    try:
+        # Monitor the health of the pipeline
+        while True:
+            time.sleep(5)
+            qsize = data_queue.qsize()
+            logging.info(f"MONITOR: Current queue size is ~{qsize}.")
+            if qsize > 150000:
+                logging.warning("MONITOR: Queue size is very high! The writer may be falling behind.")
+            
+            if not writer_process.is_alive() or not consumer_process.is_alive():
+                logging.error("FATAL: A worker process has died. Shutting down.")
+                break
+
+    except KeyboardInterrupt:
+        logging.info("Shutdown signal received. Terminating processes.")
+    finally:
+        if consumer_process.is_alive():
+            consumer_process.terminate()
+        if writer_process.is_alive():
+            writer_process.terminate()
+
