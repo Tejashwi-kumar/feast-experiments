@@ -1,0 +1,182 @@
+from typing import List, Dict, Any, Callable
+
+class RequestNormalizer:
+    """
+    A generic normalizer for transforming API request payloads into ordered feature
+    lists for model inference.
+
+    The behavior of the normalizer is controlled by a transformation configuration
+    dictionary provided during initialization.
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initializes the normalizer with a model-specific transformation config.
+
+        Args:
+            config (Dict[str, Any]): A dictionary defining the transformations.
+                Expected keys:
+                - 'output_feature_order': A list of final feature names in the
+                  order the model expects.
+                - 'transformations': A list of transformation rule dictionaries.
+        """
+        if not all(k in config for k in ['output_feature_order', 'transformations']):
+            raise ValueError("Configuration must contain 'output_feature_order' and 'transformations' keys.")
+        self.config = config
+        
+        # A small, safe mapping of function names to actual functions
+        self._supported_functions: Dict[str, Callable] = {
+            "int": int,
+            "float": float,
+            "str": str,
+            "lower": lambda s: str(s).lower()
+        }
+
+    def normalize(self, payload: Dict[str, Any]) -> List[Any]:
+        """
+        Transforms an input payload dictionary into a normalized list of features.
+
+        Args:
+            payload (Dict[str, Any]): The raw input data from the API request.
+
+        Returns:
+            List[Any]: An ordered list of feature values ready for the model.
+        """
+        processed_features: Dict[str, Any] = {}
+
+        for rule in self.config['transformations']:
+            op = rule.get('operation')
+            feature_name = rule['feature_name']
+
+            # 1. Map operation: Direct mapping from a source field
+            if op == 'map':
+                source_field = rule['source_field']
+                try:
+                    processed_features[feature_name] = payload[source_field]
+                except KeyError:
+                    raise ValueError(f"Required input field '{source_field}' is missing from the payload.")
+
+            # 2. Coalesce operation: Use a default value if source is missing
+            elif op == 'coalesce':
+                source_field = rule['source_field']
+                default_value = rule['default_value']
+                processed_features[feature_name] = payload.get(source_field, default_value)
+            
+            # 3. Apply operation: Apply a simple function to the source value
+            elif op == 'apply':
+                source_field = rule['source_field']
+                func_name = rule['function']
+                if func_name not in self._supported_functions:
+                    raise ValueError(f"Unsupported function '{func_name}'. Supported functions are: {list(self._supported_functions.keys())}")
+                
+                try:
+                    raw_value = payload[source_field]
+                    transform_func = self._supported_functions[func_name]
+                    processed_features[feature_name] = transform_func(raw_value)
+                except KeyError:
+                    raise ValueError(f"Required input field '{source_field}' for 'apply' operation is missing.")
+                except Exception as e:
+                    raise TypeError(f"Could not apply function '{func_name}' on value '{raw_value}'. Error: {e}")
+
+            # 4. Constant operation: Inject a constant value
+            elif op == 'constant':
+                processed_features[feature_name] = rule['value']
+
+            else:
+                raise ValueError(f"Unknown operation '{op}' for feature '{feature_name}'.")
+
+        # Ensure the final output is in the correct order specified by the config
+        try:
+            ordered_result = [processed_features[name] for name in self.config['output_feature_order']]
+        except KeyError as e:
+            raise RuntimeError(f"Normalization failed. Feature {e} was expected but not produced. Check your transformation rules.")
+            
+        return ordered_result
+
+
+if __name__ == '__main__':
+    print("🚀 --- ML Platform Generic Request Normalizer Demo --- 🚀")
+
+    # --- MODEL 1: Fraud Detection Model ---
+    print("\n## Use Case 1: Fraud Detection Model")
+    fraud_model_config = {
+        # The final feature vector order our scikit-learn model expects
+        'output_feature_order': ['f_amount', 'f_user_tier', 'f_is_new', 'f_country_code'],
+        
+        'transformations': [
+            # Map 'transaction_amount' from payload to 'f_amount'
+            {'feature_name': 'f_amount', 'operation': 'map', 'source_field': 'transaction_amount'},
+            
+            # Coalesce 'user_tier', defaulting to 'bronze' if not provided
+            {'feature_name': 'f_user_tier', 'operation': 'coalesce', 'source_field': 'user_tier', 'default_value': 'bronze'},
+            
+            # Coalesce 'is_new_user', defaulting to False
+            {'feature_name': 'f_is_new', 'operation': 'coalesce', 'source_field': 'is_new_user', 'default_value': False},
+            
+            # Map 'country' from payload to 'f_country_code' and convert to lowercase
+            {'feature_name': 'f_country_code', 'operation': 'apply', 'source_field': 'country', 'function': 'lower'}
+        ]
+    }
+    
+    # Initialize the normalizer for the fraud model
+    fraud_normalizer = RequestNormalizer(config=fraud_model_config)
+
+    # Simulate two different input payloads
+    payload_1 = {
+        "transaction_amount": 120.50,
+        "user_tier": "gold",
+        "country": "US"
+    }
+    
+    payload_2 = {
+        "transaction_amount": 99.99,
+        "is_new_user": True,
+        "country": "CA"
+    }
+    
+    normalized_features_1 = fraud_normalizer.normalize(payload_1)
+    normalized_features_2 = fraud_normalizer.normalize(payload_2)
+
+    print(f"\nInput Payload 1: {payload_1}")
+    print(f"Normalized Features: {normalized_features_1}")
+    
+    print(f"\nInput Payload 2: {payload_2}")
+    print(f"Normalized Features: {normalized_features_2}")
+
+    print("\n" + "-"*50)
+
+    # --- MODEL 2: Churn Prediction Model ---
+    print("\n## Use Case 2: Churn Prediction Model")
+    churn_model_config = {
+        # This model expects integer features and a constant model version
+        'output_feature_order': ['tenure', 'num_support_tickets', 'plan_type_id', 'model_version'],
+
+        'transformations': [
+             # Cast 'account_age_months' from payload (could be string) to integer 'tenure'
+            {'feature_name': 'tenure', 'operation': 'apply', 'source_field': 'account_age_months', 'function': 'int'},
+            
+            # Map 'tickets' directly to 'num_support_tickets'
+            {'feature_name': 'num_support_tickets', 'operation': 'map', 'source_field': 'tickets'},
+            
+            # Map 'plan' to 'plan_type_id'
+            {'feature_name': 'plan_type_id', 'operation': 'map', 'source_field': 'plan'},
+
+            # Add a constant feature for tracking the model version used for inference
+            {'feature_name': 'model_version', 'operation': 'constant', 'value': 'v1.2.0'}
+        ]
+    }
+    
+    # Initialize the *same* normalizer class with a *different* config
+    churn_normalizer = RequestNormalizer(config=churn_model_config)
+    
+    # Simulate an input payload for the churn model
+    churn_payload = {
+        "account_age_months": "24", # Note: this is a string
+        "tickets": 5,
+        "plan": 2 # e.g., 1=basic, 2=premium
+    }
+    
+    normalized_churn_features = churn_normalizer.normalize(churn_payload)
+    
+    print(f"\nInput Payload: {churn_payload}")
+    print(f"Normalized Features: {normalized_churn_features}")
