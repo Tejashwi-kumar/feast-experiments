@@ -1,0 +1,84 @@
+{
+  "normalizer_config": {
+    "version": "1.1",
+    "description": "Configuration for generic input payload normalization, including mapping, passthrough, coalesce, and custom functions.",
+    "transformations": [
+      {
+        "type": "field_mapping",
+        "description": "Maps a source field to a target feature name, with optional small transformations.",
+        "mappings": [
+          {
+            "source_field": "transaction_amount",
+            "target_feature_name": "f_amount_rounded",
+            "required": true,
+            "data_type": "float",
+            "apply_functions": [
+              {
+                "function": "round",
+                "params": {
+                  "decimals": 2
+                }
+              }
+            ]
+          },
+          {
+            "source_field": "user_id",
+            "target_feature_name": "f_user_identifier",
+            "required": false,
+            "default_value": "unknown",
+            "data_type": "string",
+            "apply_functions": [
+              { "function": "trim_whitespace" },
+              { "function": "to_lowercase" }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "coalesce",
+        "description": "Assigns the first non-null value from an ordered list of source fields to a target feature.",
+        "mappings": [
+          {
+            "target_feature_name": "f_customer_email",
+            "source_fields": [
+              "primary_email",
+              "customer.contact.email",
+              "user_profile.email"
+            ],
+            "default_value": "email_not_provided",
+            "apply_functions": [
+              { "function": "to_lowercase" }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "nested_field_extraction",
+        "description": "Extracts fields from nested structures using dot notation, with optional transformations.",
+        "extractions": [
+          {
+            "source_path": "customer.address.zipcode",
+            "target_feature_name": "f_zipcode",
+            "required": false,
+            "default_value": "00000",
+            "data_type": "string"
+          }
+        ]
+      },
+      {
+        "type": "default_passthrough",
+        "description": "Specifies a default behavior for any fields not explicitly handled by other transformations.",
+        "passthrough_strategy": "include_all_unmapped",
+        "prefix_unmapped_features_with": "raw_",
+        "exclude_unmapped_fields": [
+          "internal_debug_info",
+          "session_id"
+        ]
+      }
+    ],
+    "output_format": {
+      "type": "dictionary",
+      "strict_mode": false
+    }
+  }
+}
