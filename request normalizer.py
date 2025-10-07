@@ -146,3 +146,95 @@ class RequestNormalizer:
 
         Returns:
             dict: The normalized feature dictionary.
+        """
+        final_features = {}
+        processed_source_fields = set()
+
+        for transformation in self.transformations:
+            transform_type = transformation["type"]
+            
+            if transform_type == "field_mapping":
+                features = self._handle_field_mapping(payload, transformation["mappings"], processed_source_fields)
+                final_features.update(features)
+            
+            elif transform_type == "coalesce":
+                features = self._handle_coalesce(payload, transformation["mappings"], processed_source_fields)
+                final_features.update(features)
+
+            elif transform_type == "nested_field_extraction":
+                features = self._handle_nested_extraction(payload, transformation["extractions"], processed_source_fields)
+                final_features.update(features)
+            
+            elif transform_type == "default_passthrough":
+                # Passthrough is handled last, after all other fields are processed
+                continue
+
+        # Handle passthrough after all explicit mappings are complete
+        passthrough_config = next((t for t in self.transformations if t["type"] == "default_passthrough"), None)
+        if passthrough_config:
+            passthrough_features = self._handle_passthrough(payload, processed_source_fields, passthrough_config)
+            final_features.update(passthrough_features)
+
+        return final_features
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    # 1. Load the configuration from the JSON file content
+    config_json_str = """
+    {
+      "normalizer_config": {
+        "version": "1.1",
+        "transformations": [
+          { "type": "field_mapping", "mappings": [
+              { "source_field": "transaction_amount", "target_feature_name": "f_amount_rounded", "required": true, "data_type": "float", "apply_functions": [{"function": "round", "params": {"decimals": 2}}]},
+              { "source_field": "user_id", "target_feature_name": "f_user_identifier", "required": false, "default_value": "unknown", "data_type": "string", "apply_functions": [{"function": "trim_whitespace"}, {"function": "to_lowercase"}]}
+            ]
+          },
+          { "type": "coalesce", "mappings": [
+              { "target_feature_name": "f_customer_email", "source_fields": ["primary_email", "customer.contact.email", "user_profile.email"], "default_value": "email_not_provided", "apply_functions": [{"function": "to_lowercase"}]}
+            ]
+          },
+          { "type": "nested_field_extraction", "extractions": [
+              { "source_path": "customer.address.zipcode", "target_feature_name": "f_zipcode", "required": false, "default_value": "00000", "data_type": "string"}
+            ]
+          },
+          { "type": "default_passthrough", "passthrough_strategy": "include_all_unmapped", "prefix_unmapped_features_with": "raw_", "exclude_unmapped_fields": ["internal_debug_info", "session_id"]}
+        ]
+      }
+    }
+    """
+    config = json.loads(config_json_str)
+
+    # 2. Instantiate the normalizer
+    normalizer = RequestNormalizer(config)
+
+    # 3. Define some example payloads to test different scenarios
+    payloads = [
+        { # All primary fields present
+            "transaction_amount": 123.456,
+            "user_id": "  USER-001  ",
+            "primary_email": "Test@Example.COM",
+            "customer": {"contact": {"email": "ignore@this.com"}, "address": {"zipcode": "90210"}},
+            "extra_data": "some value",
+            "session_id": "xyz-abc-123" # Should be excluded
+        },
+        { # Missing optional fields, tests defaults and coalesce fallback
+            "transaction_amount": 99.9,
+            "customer": {"contact": {"email": "second@choice.org"}},
+            "internal_debug_info": {"key": "value"} # Should be excluded
+        },
+        { # No email or user_id, tests defaults
+            "transaction_amount": 50
+        }
+    ]
+
+    # 4. Process each payload and print the result
+    for i, payload in enumerate(payloads):
+        print(f"--- Processing Payload {i+1} ---")
+        print(f"Input: {payload}")
+        try:
+            features = normalizer.transform(payload)
+            print(f"Output Features: {features}\n")
+        except (ValueError, TypeError) as e:
+            print(f"Error: {e}\n")
+
