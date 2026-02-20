@@ -1,0 +1,46 @@
+import pandas as pd
+import numpy as np
+
+# 1. Create Sample Sales Data
+# We create 100 HCPs. HCP_001 is a 'Low' volume player but has one massive spike.
+np.random.seed(42)
+hcp_ids = [f'HCP_{i:03d}' for i in range(1, 101)]
+dates = pd.date_range(start='2023-01-01', periods=90, freq='D')
+
+data = []
+for hcp in hcp_ids:
+    base = np.random.choice([5, 25, 150], p=[0.6, 0.3, 0.1]) # Typical daily sales
+    sales = np.random.poisson(base, size=len(dates))
+    
+    # Inject a "Fraudulent/Anomalous" Spike for a small HCP
+    if hcp == 'HCP_001':
+        sales[10] = 5000  # Massive outlier!
+        
+    data.append(pd.DataFrame({'hcp_id': hcp, 'date': dates, 'sales': sales}))
+
+df = pd.concat(data)
+
+# 2. Robust Volume Calculation
+# Instead of sum(), we use the Median to find the "Typical Day" 
+# and scale it. This "leaves out" the 5000 unit spike for HCP_001.
+hcp_stats = df.groupby('hcp_id')['sales'].agg([
+    ('raw_sum', 'sum'),
+    ('typical_daily_sales', 'median'),
+    ('max_sale', 'max')
+]).reset_index()
+
+# Total volume used for Tiering (ignores spikes)
+hcp_stats['robust_total'] = hcp_stats['typical_daily_sales'] * len(dates)
+
+# 3. Percentile Binning
+# Define your thresholds: Top 20% = High, Next 60% = Mid, Bottom 20% = Low
+labels = ['Low Value', 'Medium Value', 'High Value']
+hcp_stats['tier'] = pd.qcut(
+    hcp_stats['robust_total'].rank(method='first'), # Rank handles duplicate values
+    q=[0, 0.2, 0.8, 1.0], 
+    labels=labels
+)
+
+# 4. Verification
+# Let's see if HCP_001 (the one with the spike) was tricked into High Value
+print(hcp_stats[hcp_stats['hcp_id'] == 'HCP_001'])
