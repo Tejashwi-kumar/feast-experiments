@@ -1,52 +1,43 @@
 import pandas as pd
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy.spatial.distance import euclidean
+from scipy.stats import ks_2samp
 
-def compare_lstm_datasets(df1, df2, entity_col, time_col, feature_cols):
+def compare_sequence_matrices(df1, df2, time_col, feature_cols):
     """
-    Compares two datasets for similarity across entity groups.
+    Compares the distribution of features at each timestep across two datasets
+    where entities are different.
     """
     results = []
     
-    # Ensure both dataframes are sorted identically
-    df1 = df1.sort_values([entity_col, time_col]).reset_index(drop=True)
-    df2 = df2.sort_values([entity_col, time_col]).reset_index(drop=True)
+    # Get common timesteps to ensure aligned comparison
+    timesteps = sorted(set(df1[time_col]).intersection(set(df2[time_col])))
     
-    entities = set(df1[entity_col]).intersection(set(df2[entity_col]))
-    
-    for entity in entities:
-        # Extract matrices for the specific entity
-        matrix1 = df1[df1[entity_col] == entity][feature_cols].values
-        matrix2 = df2[df2[entity_col] == entity][feature_cols].values
+    for t in timesteps:
+        t_df1 = df1[df1[time_col] == t]
+        t_df2 = df2[df2[time_col] == t]
         
-        # Check if shapes match (essential for LSTM sequence comparison)
-        if matrix1.shape != matrix2.shape:
-            continue 
-
-        # 1. Cosine Similarity (Average across timesteps)
-        # Measures if the 'direction' of features is similar
-        cos_sim = np.mean(np.diag(cosine_similarity(matrix1, matrix2)))
+        step_metrics = {'Timestep': t}
         
-        # 2. Euclidean Distance (Normalized by matrix size)
-        # Measures the absolute difference in values
-        dist = np.linalg.norm(matrix1 - matrix2) / matrix1.size
-        
-        results.append({
-            'Entity': entity,
-            'Cosine_Similarity': cos_sim,
-            'Avg_Abs_Diff': dist,
-            'Timesteps': matrix1.shape[0]
-        })
+        for col in feature_cols:
+            # Kolmogorov-Smirnov test: 
+            # Null hypothesis: the two samples are drawn from the same distribution.
+            # p-value < 0.05 means the distributions are significantly DIFFERENT.
+            stat, p_val = ks_2samp(t_df1[col], t_df2[col])
+            
+            # Calculate Mean Absolute Error between the means of the features
+            mean_diff = abs(t_df1[col].mean() - t_df2[col].mean())
+            
+            step_metrics[f'{col}_ks_p_val'] = round(p_val, 4)
+            step_metrics[f'{col}_mean_diff'] = round(mean_diff, 4)
+            
+        results.append(step_metrics)
     
     comparison_df = pd.DataFrame(results)
     
-    # Summary Statistics
-    print("--- Dataset Similarity Report ---")
-    print(f"Overall Mean Cosine Similarity: {comparison_df['Cosine_Similarity'].mean():.4f}")
-    print(f"Overall Mean Deviation: {comparison_df['Avg_Abs_Diff'].mean():.4f}")
-    
+    # Summary of "Drift"
+    print("--- Distribution Similarity Report (Timestep-wise) ---")
+    for col in feature_cols:
+        low_p_counts = (comparison_df[f'{col}_ks_p_val'] < 0.05).sum()
+        print(f"Feature '{col}': {low_p_counts}/{len(timesteps)} timesteps show significant distribution shift.")
+        
     return comparison_df
-
-# Example Usage:
-# report = compare_lstm_datasets(df_test_1, df_test_2, 'entity_id', 'timestamp', ['feat1', 'feat2', 'feat3'])
